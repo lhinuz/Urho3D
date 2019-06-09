@@ -1,6 +1,6 @@
 /*
   Simple DirectMedia Layer
-  Copyright (C) 1997-2017 Sam Lantinga <slouken@libsdl.org>
+  Copyright (C) 1997-2019 Sam Lantinga <slouken@libsdl.org>
 
   This software is provided 'as-is', without any express or implied
   warranty.  In no event will the authors be held liable for any damages
@@ -33,7 +33,6 @@
 #include "SDL_stdinc.h"
 #include "../SDL_sysjoystick.h"
 #include "../SDL_joystick_c.h"
-#include "../steam/SDL_steamcontroller.h"
 
 
 #if !SDL_EVENTS_DISABLED
@@ -49,6 +48,35 @@
 
 static id connectObserver = nil;
 static id disconnectObserver = nil;
+
+#include <Availability.h>
+#include <objc/message.h>
+
+// remove compilation warnings for strict builds by defining these selectors, even though
+// they are only ever used indirectly through objc_msgSend
+@interface GCExtendedGamepad (SDL)
+#if (__IPHONE_OS_VERSION_MAX_ALLOWED < 130000) || (__MAC_OS_VERSION_MAX_ALLOWED < 1500000)
+@property (nonatomic, readonly) GCControllerButtonInput *buttonMenu;
+@property (nonatomic, readonly, nullable) GCControllerButtonInput *buttonOptions;
+#endif
+#if (__IPHONE_OS_VERSION_MAX_ALLOWED < 121000) || (__MAC_OS_VERSION_MAX_ALLOWED < 1401000)
+@property (nonatomic, readonly, nullable) GCControllerButtonInput *leftThumbstickButton;
+@property (nonatomic, readonly, nullable) GCControllerButtonInput *rightThumbstickButton;
+#endif
+@end
+
+#define BUTTON_INDEX_A  0
+#define BUTTON_INDEX_B  1
+#define BUTTON_INDEX_X  2
+#define BUTTON_INDEX_Y  3
+#define BUTTON_INDEX_LEFT_SHOULDER  4
+#define BUTTON_INDEX_RIGHT_SHOULDER  5
+#define BUTTON_INDEX_GUIDE  6
+#define BUTTON_INDEX_LEFT_THUMBSTICK  7
+#define BUTTON_INDEX_RIGHT_THUMBSTICK  8
+#define BUTTON_INDEX_START  9
+#define BUTTON_INDEX_BACK  10
+
 #endif /* SDL_JOYSTICK_MFI */
 
 #if !TARGET_OS_TV
@@ -59,7 +87,7 @@ static CMMotionManager *motionManager = nil;
 static SDL_JoystickDeviceItem *deviceList = NULL;
 
 static int numjoysticks = 0;
-static SDL_JoystickID instancecounter = 0;
+int SDL_AppleTVRemoteOpenedAsJoystick = 0;
 
 static SDL_JoystickDeviceItem *
 GetDeviceForIndex(int device_index)
@@ -79,9 +107,18 @@ GetDeviceForIndex(int device_index)
 }
 
 static void
-SDL_SYS_AddMFIJoystickDevice(SDL_JoystickDeviceItem *device, GCController *controller)
+IOS_AddMFIJoystickDevice(SDL_JoystickDeviceItem *device, GCController *controller)
 {
 #ifdef SDL_JOYSTICK_MFI
+    const Uint16 VENDOR_APPLE = 0x05AC;
+    const Uint16 VENDOR_MICROSOFT = 0x045e;
+    const Uint16 VENDOR_SONY = 0x054C;
+    Uint16 *guid16 = (Uint16 *)device->guid.data;
+    Uint16 vendor = 0;
+    Uint16 product = 0;
+    Uint16 version = 0;
+    Uint8 subtype = 0;
+
     const char *name = NULL;
     /* Explicitly retain the controller because SDL_JoystickDeviceItem is a
      * struct, and ARC doesn't work with structs. */
@@ -97,39 +134,59 @@ SDL_SYS_AddMFIJoystickDevice(SDL_JoystickDeviceItem *device, GCController *contr
 
     device->name = SDL_strdup(name);
 
-    device->guid.data[0] = 'M';
-    device->guid.data[1] = 'F';
-    device->guid.data[2] = 'i';
-    device->guid.data[3] = 'G';
-    device->guid.data[4] = 'a';
-    device->guid.data[5] = 'm';
-    device->guid.data[6] = 'e';
-    device->guid.data[7] = 'p';
-    device->guid.data[8] = 'a';
-    device->guid.data[9] = 'd';
-
     if (controller.extendedGamepad) {
-        device->guid.data[10] = 1;
-    } else if (controller.gamepad) {
-        device->guid.data[10] = 2;
-    }
-#if TARGET_OS_TV
-    else if (controller.microGamepad) {
-        device->guid.data[10] = 3;
-    }
-#endif /* TARGET_OS_TV */
+        int nbuttons = 7; /* ABXY, shoulder buttons, pause button */
 
-    if (controller.extendedGamepad) {
+        if ([controller.extendedGamepad respondsToSelector:@selector(buttonMenu)]
+            && ((id (*)(id, SEL))objc_msgSend)(controller.extendedGamepad, @selector(buttonMenu))) {
+            // if we see .buttonMenu, then .buttonOption, .leftThumbstickButton (L3) & .rightThumbstickButton (R3)
+            // also exist (ios13+, macOS10.15+), though some may be nil, hold a spot for them
+            nbuttons = 11;
+        } else if ([controller.extendedGamepad respondsToSelector:@selector(leftThumbstickButton)]
+                   && ((id (*)(id, SEL))objc_msgSend)(controller.extendedGamepad, @selector(leftThumbstickButton))) {
+            // if we didn't see .buttonMenu but do see .leftThumbstickButton (L3), then .rightThumbstickButton (R3) 
+            // also exists (ios12.1+, macos10.14.1+). unlikely for R3 to be nil if L3 is not, but update code
+            // will never report a button change for R3 even so
+            nbuttons = 9;
+        }
+
+        if ([controller.vendorName containsString: @"Xbox"]) {
+            vendor = VENDOR_MICROSOFT;
+            product = 0x02E0; // assume Xbox One S BLE Controller unless/until GCController flows VID/PID
+        } else if ([controller.vendorName containsString: @"DUALSHOCK"]) {
+            vendor = VENDOR_SONY;
+            product = 0x09CC; // assume DS4 Slim unless/until GCController flows VID/PID
+        } else if (nbuttons == 9) {
+            // unknown MFi controller with L3/R3 buttons (e.g. Rotor Riot)
+            vendor = VENDOR_APPLE;
+            product = 4;
+            subtype = 4;
+        } else if (nbuttons == 11) {
+            // unkonwn MFi controller with L3/R3 and menu/options buttons (no known instances, future proofing)
+            vendor = VENDOR_APPLE;
+            product = 5;
+            subtype = 5;
+        } else {
+            vendor = VENDOR_APPLE;
+            product = 1;
+            subtype = 1;
+        }
         device->naxes = 6; /* 2 thumbsticks and 2 triggers */
         device->nhats = 1; /* d-pad */
-        device->nbuttons = 7; /* ABXY, shoulder buttons, pause button */
+        device->nbuttons = nbuttons;
     } else if (controller.gamepad) {
+        vendor = VENDOR_APPLE;
+        product = 2;
+        subtype = 2;
         device->naxes = 0; /* no traditional analog inputs */
         device->nhats = 1; /* d-pad */
         device->nbuttons = 7; /* ABXY, shoulder buttons, pause button */
     }
 #if TARGET_OS_TV
     else if (controller.microGamepad) {
+        vendor = VENDOR_APPLE;
+        product = 3;
+        subtype = 3;
         device->naxes = 2; /* treat the touch surface as two axes */
         device->nhats = 0; /* apparently the touch surface-as-dpad is buggy */
         device->nbuttons = 3; /* AX, pause button */
@@ -137,6 +194,21 @@ SDL_SYS_AddMFIJoystickDevice(SDL_JoystickDeviceItem *device, GCController *contr
         controller.microGamepad.allowsRotation = SDL_GetHintBoolean(SDL_HINT_APPLE_TV_REMOTE_ALLOW_ROTATION, SDL_FALSE);
     }
 #endif /* TARGET_OS_TV */
+
+    /* We only need 16 bits for each of these; space them out to fill 128. */
+    /* Byteswap so devices get same GUID on little/big endian platforms. */
+    *guid16++ = SDL_SwapLE16(SDL_HARDWARE_BUS_BLUETOOTH);
+    *guid16++ = 0;
+    *guid16++ = SDL_SwapLE16(vendor);
+    *guid16++ = 0;
+    *guid16++ = SDL_SwapLE16(product);
+    *guid16++ = 0;
+    *guid16++ = SDL_SwapLE16(version);
+    *guid16++ = 0;
+
+    /* Note that this is an MFI controller and what subtype it is */
+    device->guid.data[14] = 'm';
+    device->guid.data[15] = subtype;
 
     /* This will be set when the first button press of the controller is
      * detected. */
@@ -146,9 +218,18 @@ SDL_SYS_AddMFIJoystickDevice(SDL_JoystickDeviceItem *device, GCController *contr
 }
 
 static void
-SDL_SYS_AddJoystickDevice(GCController *controller, SDL_bool accelerometer)
+IOS_AddJoystickDevice(GCController *controller, SDL_bool accelerometer)
 {
     SDL_JoystickDeviceItem *device = deviceList;
+
+#if TARGET_OS_TV
+    if (!SDL_GetHintBoolean(SDL_HINT_TV_REMOTE_AS_JOYSTICK, SDL_TRUE)) {
+        /* Ignore devices that aren't actually controllers (e.g. remotes), they'll be handled as keyboard input */
+        if (controller && !controller.extendedGamepad && !controller.gamepad && controller.microGamepad) {
+            return;
+        }
+    }
+#endif
 
     while (device != NULL) {
         if (device->controller == controller) {
@@ -157,15 +238,13 @@ SDL_SYS_AddJoystickDevice(GCController *controller, SDL_bool accelerometer)
         device = device->next;
     }
 
-    device = (SDL_JoystickDeviceItem *) SDL_malloc(sizeof(SDL_JoystickDeviceItem));
+    device = (SDL_JoystickDeviceItem *) SDL_calloc(1, sizeof(SDL_JoystickDeviceItem));
     if (device == NULL) {
         return;
     }
 
-    SDL_zerop(device);
-
     device->accelerometer = accelerometer;
-    device->instance_id = instancecounter++;
+    device->instance_id = SDL_GetNextJoystickInstanceID();
 
     if (accelerometer) {
 #if TARGET_OS_TV
@@ -181,7 +260,7 @@ SDL_SYS_AddJoystickDevice(GCController *controller, SDL_bool accelerometer)
         SDL_memcpy(&device->guid.data, device->name, SDL_min(sizeof(SDL_JoystickGUID), SDL_strlen(device->name)));
 #endif /* TARGET_OS_TV */
     } else if (controller) {
-        SDL_SYS_AddMFIJoystickDevice(device, controller);
+        IOS_AddMFIJoystickDevice(device, controller);
     }
 
     if (deviceList == NULL) {
@@ -196,11 +275,11 @@ SDL_SYS_AddJoystickDevice(GCController *controller, SDL_bool accelerometer)
 
     ++numjoysticks;
 
-    SDL_PrivateJoystickAdded(numjoysticks - 1);
+    SDL_PrivateJoystickAdded(device->instance_id);
 }
 
 static SDL_JoystickDeviceItem *
-SDL_SYS_RemoveJoystickDevice(SDL_JoystickDeviceItem *device)
+IOS_RemoveJoystickDevice(SDL_JoystickDeviceItem *device)
 {
     SDL_JoystickDeviceItem *prev = NULL;
     SDL_JoystickDeviceItem *next = NULL;
@@ -269,78 +348,27 @@ SDL_AppleTVRemoteRotationHintChanged(void *udata, const char *name, const char *
 }
 #endif /* TARGET_OS_TV */
 
-static SDL_bool SteamControllerConnectedCallback(const char *name, SDL_JoystickGUID guid, int *device_instance)
-{
-    SDL_JoystickDeviceItem *device = (SDL_JoystickDeviceItem *)SDL_calloc(1, sizeof(SDL_JoystickDeviceItem));
-    if (device == NULL) {
-        return SDL_FALSE;
-    }
-
-    *device_instance = device->instance_id = instancecounter++;
-	device->name = SDL_strdup(name);
-	device->guid = guid;
-	SDL_GetSteamControllerInputs(&device->nbuttons,
-								 &device->naxes,
-								 &device->nhats);
-    device->m_bSteamController = SDL_TRUE;
-
-    if (deviceList == NULL) {
-        deviceList = device;
-    } else {
-        SDL_JoystickDeviceItem *lastdevice = deviceList;
-        while (lastdevice->next != NULL) {
-            lastdevice = lastdevice->next;
-        }
-        lastdevice->next = device;
-    }
-
-    ++numjoysticks;
-
-    SDL_PrivateJoystickAdded(numjoysticks - 1);
-
-    return SDL_TRUE;
-}
-
-static void SteamControllerDisconnectedCallback(int device_instance)
-{
-    SDL_JoystickDeviceItem *item;
-
-	for (item = deviceList; item; item = item->next) {
-        if (item->instance_id == device_instance) {
-			SDL_SYS_RemoveJoystickDevice(item);
-			break;
-        }
-    }
-}
-
-/* Function to scan the system for joysticks.
- * Joystick 0 should be the system default joystick.
- * It should return 0, or -1 on an unrecoverable fatal error.
- */
-int
-SDL_SYS_JoystickInit(void)
+static int
+IOS_JoystickInit(void)
 {
     @autoreleasepool {
         NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
 
-        SDL_InitSteamControllers(SteamControllerConnectedCallback,
-                                 SteamControllerDisconnectedCallback);
-
 #if !TARGET_OS_TV
         if (SDL_GetHintBoolean(SDL_HINT_ACCELEROMETER_AS_JOYSTICK, SDL_TRUE)) {
             /* Default behavior, accelerometer as joystick */
-            SDL_SYS_AddJoystickDevice(nil, SDL_TRUE);
+            IOS_AddJoystickDevice(nil, SDL_TRUE);
         }
 #endif /* !TARGET_OS_TV */
 
 #ifdef SDL_JOYSTICK_MFI
         /* GameController.framework was added in iOS 7. */
         if (![GCController class]) {
-            return numjoysticks;
+            return 0;
         }
 
         for (GCController *controller in [GCController controllers]) {
-            SDL_SYS_AddJoystickDevice(controller, SDL_FALSE);
+            IOS_AddJoystickDevice(controller, SDL_FALSE);
         }
 
 #if TARGET_OS_TV
@@ -353,7 +381,7 @@ SDL_SYS_JoystickInit(void)
                                                queue:nil
                                           usingBlock:^(NSNotification *note) {
                                               GCController *controller = note.object;
-                                              SDL_SYS_AddJoystickDevice(controller, SDL_FALSE);
+                                              IOS_AddJoystickDevice(controller, SDL_FALSE);
                                           }];
 
         disconnectObserver = [center addObserverForName:GCControllerDidDisconnectNotification
@@ -364,7 +392,7 @@ SDL_SYS_JoystickInit(void)
                                                  SDL_JoystickDeviceItem *device = deviceList;
                                                  while (device != NULL) {
                                                      if (device->controller == controller) {
-                                                         SDL_SYS_RemoveJoystickDevice(device);
+                                                         IOS_RemoveJoystickDevice(device);
                                                          break;
                                                      }
                                                      device = device->next;
@@ -373,43 +401,55 @@ SDL_SYS_JoystickInit(void)
 #endif /* SDL_JOYSTICK_MFI */
     }
 
-    return numjoysticks;
+    return 0;
 }
 
-int
-SDL_SYS_NumJoysticks(void)
+static int
+IOS_JoystickGetCount(void)
 {
     return numjoysticks;
 }
 
-void
-SDL_SYS_JoystickDetect(void)
+static void
+IOS_JoystickDetect(void)
 {
-    SDL_UpdateSteamControllers();
 }
 
-/* Function to get the device-dependent name of a joystick */
-const char *
-SDL_SYS_JoystickNameForDeviceIndex(int device_index)
+static const char *
+IOS_JoystickGetDeviceName(int device_index)
 {
     SDL_JoystickDeviceItem *device = GetDeviceForIndex(device_index);
     return device ? device->name : "Unknown";
 }
 
-/* Function to perform the mapping from device index to the instance id for this index */
-SDL_JoystickID SDL_SYS_GetInstanceIdOfDeviceIndex(int device_index)
+static int
+IOS_JoystickGetDevicePlayerIndex(int device_index)
 {
-    SDL_JoystickDeviceItem *device = GetDeviceForIndex(device_index);
-    return device ? device->instance_id : 0;
+    return -1;
 }
 
-/* Function to open a joystick for use.
-   The joystick to open is specified by the device index.
-   This should fill the nbuttons and naxes fields of the joystick structure.
-   It returns 0, or -1 if there is an error.
- */
-int
-SDL_SYS_JoystickOpen(SDL_Joystick * joystick, int device_index)
+static SDL_JoystickGUID
+IOS_JoystickGetDeviceGUID( int device_index )
+{
+    SDL_JoystickDeviceItem *device = GetDeviceForIndex(device_index);
+    SDL_JoystickGUID guid;
+    if (device) {
+        guid = device->guid;
+    } else {
+        SDL_zero(guid);
+    }
+    return guid;
+}
+
+static SDL_JoystickID
+IOS_JoystickGetDeviceInstanceID(int device_index)
+{
+    SDL_JoystickDeviceItem *device = GetDeviceForIndex(device_index);
+    return device ? device->instance_id : -1;
+}
+
+static int
+IOS_JoystickOpen(SDL_Joystick * joystick, int device_index)
 {
     SDL_JoystickDeviceItem *device = GetDeviceForIndex(device_index);
     if (device == NULL) {
@@ -448,19 +488,15 @@ SDL_SYS_JoystickOpen(SDL_Joystick * joystick, int device_index)
 #endif /* SDL_JOYSTICK_MFI */
         }
     }
+    if (device->remote) {
+        ++SDL_AppleTVRemoteOpenedAsJoystick;
+    }
 
     return 0;
 }
 
-/* Function to determine if this joystick is attached to the system right now */
-SDL_bool
-SDL_SYS_JoystickAttached(SDL_Joystick *joystick)
-{
-    return joystick->hwdata != NULL;
-}
-
 static void
-SDL_SYS_AccelerometerUpdate(SDL_Joystick * joystick)
+IOS_AccelerometerUpdate(SDL_Joystick * joystick)
 {
 #if !TARGET_OS_TV
     const float maxgforce = SDL_IPHONE_MAX_GFORCE;
@@ -505,7 +541,7 @@ SDL_SYS_AccelerometerUpdate(SDL_Joystick * joystick)
 
 #ifdef SDL_JOYSTICK_MFI
 static Uint8
-SDL_SYS_MFIJoystickHatStateForDPad(GCControllerDirectionPad *dpad)
+IOS_MFIJoystickHatStateForDPad(GCControllerDirectionPad *dpad)
 {
     Uint8 hat = 0;
 
@@ -530,7 +566,7 @@ SDL_SYS_MFIJoystickHatStateForDPad(GCControllerDirectionPad *dpad)
 #endif
 
 static void
-SDL_SYS_MFIJoystickUpdate(SDL_Joystick * joystick)
+IOS_MFIJoystickUpdate(SDL_Joystick * joystick)
 {
 #if SDL_JOYSTICK_MFI
     @autoreleasepool {
@@ -553,14 +589,27 @@ SDL_SYS_MFIJoystickUpdate(SDL_Joystick * joystick)
             };
 
             /* Button order matches the XInput Windows mappings. */
-            Uint8 buttons[] = {
-                gamepad.buttonA.isPressed, gamepad.buttonB.isPressed,
-                gamepad.buttonX.isPressed, gamepad.buttonY.isPressed,
-                gamepad.leftShoulder.isPressed,
-                gamepad.rightShoulder.isPressed,
-            };
+            Uint8 buttons[joystick->nbuttons];
+            buttons[BUTTON_INDEX_A] = gamepad.buttonA.isPressed;
+            buttons[BUTTON_INDEX_B] = gamepad.buttonB.isPressed;
+            buttons[BUTTON_INDEX_X] = gamepad.buttonX.isPressed;
+            buttons[BUTTON_INDEX_Y] = gamepad.buttonY.isPressed;
+            buttons[BUTTON_INDEX_LEFT_SHOULDER] = gamepad.leftShoulder.isPressed;
+            buttons[BUTTON_INDEX_RIGHT_SHOULDER] = gamepad.rightShoulder.isPressed;
+            buttons[BUTTON_INDEX_GUIDE] = joystick->delayed_guide_button;
 
-            hatstate = SDL_SYS_MFIJoystickHatStateForDPad(gamepad.dpad);
+            // previously checked for availability of these iOS12.1+/macOS10.14.1+ or iOS13+/macOS10.15+
+            // selectors. they exist but may be nil, in which case objc_msgSend will return 0/false for isPressed
+            if (joystick->nbuttons > 8) {
+                buttons[BUTTON_INDEX_LEFT_THUMBSTICK] = ((Uint8 (*)(id, SEL))objc_msgSend)( ((id (*)(id, SEL))objc_msgSend)(gamepad, @selector(leftThumbstickButton)), @selector(isPressed) );
+                buttons[BUTTON_INDEX_RIGHT_THUMBSTICK] = ((Uint8 (*)(id, SEL))objc_msgSend)( ((id (*)(id, SEL))objc_msgSend)(gamepad, @selector(rightThumbstickButton)), @selector(isPressed) );
+            }
+            if (joystick->nbuttons > 10) {
+                buttons[BUTTON_INDEX_START] = ((Uint8 (*)(id, SEL))objc_msgSend)( ((id (*)(id, SEL))objc_msgSend)(gamepad, @selector(buttonMenu)), @selector(isPressed) );
+                buttons[BUTTON_INDEX_BACK] = ((Uint8 (*)(id, SEL))objc_msgSend)( ((id (*)(id, SEL))objc_msgSend)(gamepad, @selector(buttonOptions)), @selector(isPressed) );
+            }
+
+            hatstate = IOS_MFIJoystickHatStateForDPad(gamepad.dpad);
 
             for (i = 0; i < SDL_arraysize(axes); i++) {
                 /* The triggers (axes 2 and 5) are resting at -32768 but SDL
@@ -585,9 +634,10 @@ SDL_SYS_MFIJoystickUpdate(SDL_Joystick * joystick)
                 gamepad.buttonX.isPressed, gamepad.buttonY.isPressed,
                 gamepad.leftShoulder.isPressed,
                 gamepad.rightShoulder.isPressed,
+                joystick->delayed_guide_button,
             };
 
-            hatstate = SDL_SYS_MFIJoystickHatStateForDPad(gamepad.dpad);
+            hatstate = IOS_MFIJoystickHatStateForDPad(gamepad.dpad);
 
             for (i = 0; i < SDL_arraysize(buttons); i++) {
                 updateplayerindex |= (joystick->buttons[i] != buttons[i]);
@@ -608,20 +658,16 @@ SDL_SYS_MFIJoystickUpdate(SDL_Joystick * joystick)
                 SDL_PrivateJoystickAxis(joystick, i, axes[i]);
             }
 
-            /* Apparently the dpad values are not accurate enough to be useful. */
-            /* hatstate = SDL_SYS_MFIJoystickHatStateForDPad(gamepad.dpad); */
-
             Uint8 buttons[] = {
                 gamepad.buttonA.isPressed,
                 gamepad.buttonX.isPressed,
+                joystick->delayed_guide_button,
             };
 
             for (i = 0; i < SDL_arraysize(buttons); i++) {
                 updateplayerindex |= (joystick->buttons[i] != buttons[i]);
                 SDL_PrivateJoystickButton(joystick, i, buttons[i]);
             }
-
-            /* TODO: Figure out what to do with reportsAbsoluteDpadValues */
         }
 #endif /* TARGET_OS_TV */
 
@@ -631,15 +677,10 @@ SDL_SYS_MFIJoystickUpdate(SDL_Joystick * joystick)
         }
 
         for (i = 0; i < joystick->hwdata->num_pause_presses; i++) {
-            /* The pause button is always last. */
-            Uint8 pausebutton = joystick->nbuttons - 1;
-
-            SDL_PrivateJoystickButton(joystick, pausebutton, SDL_PRESSED);
-            SDL_PrivateJoystickButton(joystick, pausebutton, SDL_RELEASED);
-
+            SDL_PrivateJoystickButton(joystick, BUTTON_INDEX_GUIDE, SDL_PRESSED);
+            SDL_PrivateJoystickButton(joystick, BUTTON_INDEX_GUIDE, SDL_RELEASED);
             updateplayerindex = YES;
         }
-
         joystick->hwdata->num_pause_presses = 0;
 
         if (updateplayerindex && controller.playerIndex == -1) {
@@ -666,13 +707,14 @@ SDL_SYS_MFIJoystickUpdate(SDL_Joystick * joystick)
 #endif /* SDL_JOYSTICK_MFI */
 }
 
-/* Function to update the state of a joystick - called as a device poll.
- * This function shouldn't update the joystick structure directly,
- * but instead should call SDL_PrivateJoystick*() to deliver events
- * and update joystick device state.
- */
-void
-SDL_SYS_JoystickUpdate(SDL_Joystick * joystick)
+static int
+IOS_JoystickRumble(SDL_Joystick * joystick, Uint16 low_frequency_rumble, Uint16 high_frequency_rumble, Uint32 duration_ms)
+{
+    return SDL_Unsupported();
+}
+
+static void
+IOS_JoystickUpdate(SDL_Joystick * joystick)
 {
     SDL_JoystickDeviceItem *device = joystick->hwdata;
 
@@ -680,21 +722,15 @@ SDL_SYS_JoystickUpdate(SDL_Joystick * joystick)
         return;
     }
     
-    if (device->m_bSteamController) {
-        SDL_UpdateSteamController(joystick);
-        return;
-    }
-
     if (device->accelerometer) {
-        SDL_SYS_AccelerometerUpdate(joystick);
+        IOS_AccelerometerUpdate(joystick);
     } else if (device->controller) {
-        SDL_SYS_MFIJoystickUpdate(joystick);
+        IOS_MFIJoystickUpdate(joystick);
     }
 }
 
-/* Function to close a joystick after use */
-void
-SDL_SYS_JoystickClose(SDL_Joystick * joystick)
+static void
+IOS_JoystickClose(SDL_Joystick * joystick)
 {
     SDL_JoystickDeviceItem *device = joystick->hwdata;
 
@@ -717,11 +753,13 @@ SDL_SYS_JoystickClose(SDL_Joystick * joystick)
 #endif
         }
     }
+    if (device->remote) {
+        --SDL_AppleTVRemoteOpenedAsJoystick;
+    }
 }
 
-/* Function to perform any system-specific joystick related cleanup */
-void
-SDL_SYS_JoystickQuit(void)
+static void
+IOS_JoystickQuit(void)
 {
     @autoreleasepool {
 #ifdef SDL_JOYSTICK_MFI
@@ -744,7 +782,7 @@ SDL_SYS_JoystickQuit(void)
 #endif /* SDL_JOYSTICK_MFI */
 
         while (deviceList != NULL) {
-            SDL_SYS_RemoveJoystickDevice(deviceList);
+            IOS_RemoveJoystickDevice(deviceList);
         }
 
 #if !TARGET_OS_TV
@@ -752,34 +790,23 @@ SDL_SYS_JoystickQuit(void)
 #endif /* !TARGET_OS_TV */
     }
 
-    SDL_QuitSteamControllers();
-
     numjoysticks = 0;
 }
 
-SDL_JoystickGUID
-SDL_SYS_JoystickGetDeviceGUID( int device_index )
+SDL_JoystickDriver SDL_IOS_JoystickDriver =
 {
-    SDL_JoystickDeviceItem *device = GetDeviceForIndex(device_index);
-    SDL_JoystickGUID guid;
-    if (device) {
-        guid = device->guid;
-    } else {
-        SDL_zero(guid);
-    }
-    return guid;
-}
-
-SDL_JoystickGUID
-SDL_SYS_JoystickGetGUID(SDL_Joystick * joystick)
-{
-    SDL_JoystickGUID guid;
-    if (joystick->hwdata) {
-        guid = joystick->hwdata->guid;
-    } else {
-        SDL_zero(guid);
-    }
-    return guid;
-}
+    IOS_JoystickInit,
+    IOS_JoystickGetCount,
+    IOS_JoystickDetect,
+    IOS_JoystickGetDeviceName,
+    IOS_JoystickGetDevicePlayerIndex,
+    IOS_JoystickGetDeviceGUID,
+    IOS_JoystickGetDeviceInstanceID,
+    IOS_JoystickOpen,
+    IOS_JoystickRumble,
+    IOS_JoystickUpdate,
+    IOS_JoystickClose,
+    IOS_JoystickQuit,
+};
 
 /* vi: set ts=4 sw=4 expandtab: */
